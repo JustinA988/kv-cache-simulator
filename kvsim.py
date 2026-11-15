@@ -64,14 +64,23 @@ class BlockPool:
         self.k = np.zeros((num_blocks, block_size, dim), np.float32)
         self.v = np.zeros((num_blocks, block_size, dim), np.float32)
         self.free = list(range(num_blocks - 1, -1, -1))
+        self.refs = [0] * num_blocks  # how many sequences point at each block (prefix sharing)
 
     def alloc(self):
         if not self.free:
             raise MemoryError("block pool exhausted")
-        return self.free.pop()
+        b = self.free.pop()
+        self.refs[b] = 1
+        return b
+
+    def share(self, block):
+        self.refs[block] += 1
 
     def release(self, block):
-        self.free.append(block)
+        assert self.refs[block] > 0, f"double free of block {block}"
+        self.refs[block] -= 1
+        if self.refs[block] == 0:
+            self.free.append(block)
 
     @property
     def in_use(self):
@@ -91,6 +100,23 @@ class PagedCache:
         self.table = []       # physical block ids, oldest first
         self.n = 0            # logical length (tokens ever appended)
         self.first_block = 0  # logical block index of table[0]
+
+    @classmethod
+    def from_prefix(cls, parent, n_tokens):
+        """New sequence that reuses parent's first n_tokens (e.g. a shared system prompt).
+
+        Full blocks are shared by refcount, not copied. The tail of a partial block is left
+        for the caller to append, so a shared block is never written to (no copy-on-write needed).
+        Returns (cache, tokens_reused).
+        """
+        assert parent.first_block == 0 and not parent.window, "share only from an un-evicted prefix"
+        bs = parent.pool.block_size
+        child = cls(parent.pool)
+        child.table = parent.table[: min(n_tokens, parent.n) // bs]
+        for b in child.table:
+            parent.pool.share(b)
+        child.n = len(child.table) * bs
+        return child, child.n
 
     def append(self, k, v):
         bs = self.pool.block_size
@@ -211,6 +237,47 @@ def batch_capacity(budget_tokens, lengths, block_size):
     return contiguous, paged
 
 
+def shared_prefix(n_requests=32, prefix_len=2000, suffix_len=200, block_size=16, seed=0):
+    """N requests = same system prompt + their own text. Blocks and compute, with vs without sharing.
+
+    Also checks every request's attention output is identical either way.
+    """
+    rng = np.random.default_rng(seed)
+    total = prefix_len + suffix_len
+    sys_k, sys_v = rng.standard_normal((2, prefix_len, SIM_DIM), dtype=np.float32)
+    q = rng.standard_normal(SIM_DIM, dtype=np.float32)
+    blocks_needed = n_requests * math.ceil(total / block_size) + 1
+    result = {"requests": n_requests, "prefix": prefix_len, "suffix": suffix_len}
+
+    for mode in ("private", "shared"):
+        pool = BlockPool(blocks_needed, block_size)
+        computed, seqs, outs = 0, [], []
+        parent = None
+        if mode == "shared":
+            parent = PagedCache(pool)
+            for i in range(prefix_len):
+                parent.append(sys_k[i], sys_v[i])
+            computed += prefix_len
+        for r in range(n_requests):
+            own_k, own_v = np.random.default_rng(seed + 1 + r).standard_normal((2, suffix_len, SIM_DIM), dtype=np.float32)
+            k_all, v_all = np.concatenate([sys_k, own_k]), np.concatenate([sys_v, own_v])
+            c, start = PagedCache.from_prefix(parent, prefix_len) if parent else (PagedCache(pool), 0)
+            for i in range(start, total):
+                c.append(k_all[i], v_all[i])
+            computed += total - start
+            k, v, _ = c.view()
+            outs.append(attend(q, k, v))
+            seqs.append(c)
+        if parent:
+            parent.free()  # children still hold refs, so shared blocks stay alive
+        result[mode] = {"blocks": pool.in_use, "mem_mb": pool.in_use * block_size * ModelCfg().bytes_per_token / 2**20,
+                        "computed": computed, "outputs": np.array(outs)}
+        for c in seqs:
+            c.free()
+        assert pool.in_use == 0, "leaked blocks"
+    return result
+
+
 # ---------------------------------------------------------------- CLI
 
 def main():
@@ -238,6 +305,14 @@ def main():
     c, pg = batch_capacity(budget, lengths, args.block_size)
     print(f"Concurrent requests in 80 GB of KV memory (lengths 100-10,000): "
           f"contiguous={c}  paged={pg}  ({pg / max(c, 1):.1f}x)")
+
+    s = shared_prefix(block_size=args.block_size)
+    p, sh = s["private"], s["shared"]
+    print(f"\nPrefix sharing ({s['requests']} requests, {s['prefix']}-token shared system prompt + {s['suffix']} own):")
+    print(f"  private: {p['mem_mb']:>7.0f} MB  {p['computed']:>6} tokens computed")
+    print(f"  shared:  {sh['mem_mb']:>7.0f} MB  {sh['computed']:>6} tokens computed  "
+          f"({p['mem_mb'] / sh['mem_mb']:.1f}x less memory, outputs identical: "
+          f"{np.allclose(p['outputs'], sh['outputs'])})")
 
 
 if __name__ == "__main__":
