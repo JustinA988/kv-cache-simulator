@@ -1,7 +1,7 @@
 """Run: python test_kvsim.py  (or pytest)"""
 import numpy as np
 
-from kvsim import BlockPool, PagedCache, attend, batch_capacity, fake_model, simulate
+from kvsim import BlockPool, PagedCache, attend, batch_capacity, fake_model, shared_prefix, simulate
 
 
 def test_paged_matches_contiguous_and_nocache():
@@ -46,6 +46,29 @@ def test_paged_waste_under_one_block():
     r = simulate("paged", 1000, 7, block_size=16)
     assert r["waste_pct"] < 16 / 1007 * 100
     assert simulate("contiguous", 1000, 7)["waste_pct"] > 80
+
+
+def test_prefix_sharing_refcounts():
+    pool = BlockPool(10, 4)
+    parent = PagedCache(pool)
+    z = np.zeros(pool.k.shape[-1])
+    for _ in range(10):  # 2 full blocks + half a block
+        parent.append(z, z)
+    child, reused = PagedCache.from_prefix(parent, 10)
+    assert reused == 8 and child.table == parent.table[:2]
+    child.append(z, z)  # child's tail goes in a new private block
+    assert child.table[2] != parent.table[2] and pool.in_use == 4
+    parent.free()
+    assert pool.in_use == 3  # shared blocks survive while child holds them
+    child.free()
+    assert pool.in_use == 0
+
+
+def test_shared_prefix_saves_memory_same_outputs():
+    s = shared_prefix(n_requests=8, prefix_len=500, suffix_len=50)
+    assert np.allclose(s["private"]["outputs"], s["shared"]["outputs"])
+    assert s["shared"]["blocks"] < s["private"]["blocks"] / 3
+    assert s["shared"]["computed"] < s["private"]["computed"] / 3
 
 
 def test_batch_capacity():
