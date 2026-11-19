@@ -86,3 +86,7 @@ kvsim.py        caches, block pool, generation loop, benchmarks, CLI
 test_kvsim.py   correctness tests (paged == contiguous outputs, window bounds, refcounts, ...)
 plots.py        builds docs/results.png
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
